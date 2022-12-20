@@ -3,56 +3,66 @@
 #include <mutex>
 #include <vector>
 #include <queue>
+#include <future>
 
 using namespace std;
 
-typedef vector<bool>::reference status;
-typedef function<void(status complete)> func;
-
-mutex m1, m2;
-
+template<typename T>
 class safe_queue
 {
+    queue<T> m_items;
+    mutex mt;
 public:
-    queue<func> tasks;
-
-    void push(func &f)
+    void push(T &item)
     {
-        m1.lock();
-        tasks.push(f);
-        m1.unlock();
+        lock_guard<mutex> lk(mt);
+        m_items.push(move(item));
     }
-    func pop()
+    T pop()
     {
-        m1.lock();
-        auto next = tasks.front();
-        tasks.pop();
-        m1.unlock();
-        return next;
+        lock_guard<mutex> lk(mt);
+        auto first = move(m_items.front());
+        m_items.pop();
+        return first;
     }
     bool has_items()
     {
-        return !tasks.empty();
+        return !m_items.empty();
     }
 };
 
+typedef packaged_task<int()> func;
+typedef pair<func,string> task;
+typedef tuple<int,bool,shared_future<int>> info;
+
 class thread_pool
 {
-public:
+    safe_queue<task> tasks;
     vector<thread> pool;
-    vector<bool> ready;
-    safe_queue tasks;
-    thread handle;
+    vector<info> res;
+    thread handler;
+    thread logger;
+    mutex mt;
 public:
     thread_pool(int size)
     {
         pool = vector<thread>(size);
-        ready = vector<bool>(size, true);
-        handle = thread(&thread_pool::work, this);
+        res = vector<info>(size);
+
+        for (int n=0; n<size; n++)
+        {
+            get<0>(res[n]) = 0;
+            get<1>(res[n]) = true;
+            get<2>(res[n]) = async([]{return 0;});
+        }
+
+        handler = thread(&thread_pool::work, this);
+        logger = thread(&thread_pool::report, this);
     }
     ~thread_pool()
     {
-        handle.detach();
+        handler.join();
+        logger.join();
     }
     void work()
     {
@@ -60,43 +70,72 @@ public:
         {
             for (int n=0; n<pool.size(); n++)
             {
-                if (tasks.has_items() == true && ready[n] == true)
+                if (tasks.has_items())
+                if (get<1>(res[n]) == true)
+                if (get<2>(res[n]).wait_for(0ms) == future_status::ready)
                 {
-                    ready[n] = false;
-                    pool[n] = thread(tasks.pop(), ready[n]);
-                    pool[n].detach();
+                    lock_guard<mutex> lk(mt);
+                    auto pop_pair = tasks.pop();
+                    auto task = move(pop_pair.first);
+                    auto tag = move(pop_pair.second);
+                    get<2>(res[n]) = task.get_future();
+                    get<1>(res[n]) = false;
+                    get<0>(res[n]) = n;
+                    cout << "Thread " << n << " started function " << tag << endl;
+                    pool[n] = thread(move(task));
                 }
             }
         }
     }
-    void submit(func &f)
+    void report()
     {
-        tasks.push(ref(f));
+        while (true)
+        {
+            for (int n=0; n<pool.size(); n++)
+            {
+                if (get<1>(res[n]) == false)
+                if (get<2>(res[n]).wait_for(0ms) == future_status::ready)
+                {
+                    lock_guard<mutex> lk(mt);
+                    auto id = get<0>(res[n]);
+                    auto result = get<2>(res[n]).get();
+                    cout << "Thread " << id << " completed with value " << result << endl;
+                    get<1>(res[n]) = true;
+                    pool[n].join();
+                }
+            }
+        }
+    }
+    void submit(func &foo, const string &tag)
+    {
+        task this_pair(move(foo),move(tag));
+        tasks.push(this_pair);
     }
 };
 
 int main()
 {
     thread_pool p(4);
-
-    func first = [&](status complete) {
-        m2.lock();
+    auto my_func_1 = [&]() 
+    {
         cout << "first_func_running..." << endl;
-        m2.unlock();
-        complete = true;
+        this_thread::sleep_for(600ms);
+        return 1;
     };
-    func second = [&](status complete) {
-        m2.lock();
+    auto my_func_2 = [&]() 
+    {
         cout << "second_func_running..." << endl;
-        m2.unlock();
-        complete = true;
+        this_thread::sleep_for(800ms);
+        return 2;
     };
-
+    
     while (true)
     {
-        p.submit(first);
-        p.submit(second);
-        this_thread::sleep_for(1s);
+        func first_foo(my_func_1);
+        func second_foo(my_func_2);
+        p.submit(first_foo, "func_1");
+        p.submit(second_foo, "func_2");
+        this_thread::sleep_for(1000ms);
     }
 
     return 0;
